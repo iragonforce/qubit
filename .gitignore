@@ -92,3 +92,4 @@
 !user/.config/nvim/plugin/nvlime_live_autodoc.lua
 !user/.config/nvim/plugin/smart_tab_languages.lua
 !user/.config/nvim/plugin/ui_overrides.lua
+!user/.zshenv
