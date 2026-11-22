@@ -1,0 +1,3 @@
+/Users/nexus-smb/fast -fstype=smbfs,nosuid,nodev,noowners ://guest:@nexus/fast
+/Users/nexus-smb/bulk -fstype=smbfs,nosuid,nodev,noowners ://guest:@nexus/bulk
+/Users/nexus-smb/t7 -fstype=smbfs,nosuid,nodev,noowners ://guest:@nexus/T7

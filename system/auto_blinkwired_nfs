@@ -1,0 +1,5 @@
+# Hostname-based mounts: LAN at home, Tailscale routing when remote.
+/Users/nexus/bulk -fstype=nfs,vers=4,tcp,resvport,rw,nosuid,nodev,nobrowse nexus:/bulk
+/Users/nexus/t7 -fstype=nfs,vers=4,tcp,resvport,rw,nosuid,nodev,nobrowse nexus:/t7
+/Users/nexus/fast -fstype=nfs,vers=4,tcp,resvport,rw,nosuid,nodev,nobrowse nexus:/fast
+/Users/tensor -fstype=nfs,vers=4.1,tcp,resvport,rw,nosuid,nodev,nobrowse tensor:/home/iragonforce
