@@ -1,0 +1,7 @@
+*
+!.gitignore
+!README.md
+!AGENTS.md
+!.githooks/
+!.githooks/pre-commit
+!.githooks/pre-push
