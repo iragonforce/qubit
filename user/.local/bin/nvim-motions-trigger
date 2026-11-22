@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Trigger Neovim Motions through RPC when available. See nvim-motions-trigger(1) for source and integration details.
+if [ "${1-}" = '--help' ] && [ "$#" -eq 1 ]; then
+  cat <<'OPS_USAGE_TEXT'
+Trigger Neovim Motions through RPC when available.
+Usage: nvim-motions-trigger 
+
+Source: hosts/qubit/files/.local/bin/nvim-motions-trigger in ~/ops
+See man nvim-motions-trigger for the existing call sites and argument handling.
+OPS_USAGE_TEXT
+  exit 0
+fi
+# Prefer Neovim RPC to avoid injecting :Motions into an unfinished Ex command.
+set -euo pipefail
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+LOG="$HOME/.local/state/nvim-motions-trigger.log"
+mkdir -p "$(dirname "$LOG")"
+log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
+fail() { log "FAIL: $*"; printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+
+log "Trigger started (TMUX=${TMUX:-unset})"
+command -v tmux >/dev/null 2>&1 || fail 'tmux unavailable'
+tmux list-sessions >/dev/null 2>&1 || fail 'no reachable tmux server'
+
+pane=''
+latest=-1
+ambiguous=0
+while IFS='|' read -r client activity; do
+  [[ -n "$client" ]] || continue
+  current=$(tmux display-message -p -c "$client" '#{pane_id}|#{pane_current_command}' 2>/dev/null || true)
+  [[ "$current" == *'|nvim' ]] || continue
+  candidate=${current%%|*}
+  if [[ "$activity" =~ ^[0-9]+$ ]] && (( activity > latest )); then
+    latest=$activity
+    pane=$candidate
+    ambiguous=0
+  elif [[ "$activity" =~ ^[0-9]+$ ]] && (( activity == latest )) && [[ "$candidate" != "$pane" ]]; then
+    ambiguous=1
+  fi
+done < <(tmux list-clients -F '#{client_name}|#{client_activity}' 2>/dev/null || true)
+
+(( ambiguous == 0 )) || fail 'multiple equally recent attached Neovim clients'
+if [[ -z "$pane" ]]; then
+  matches=()
+  while IFS='|' read -r p cmd active; do
+    [[ "$cmd" == nvim && "$active" == 1 ]] && matches+=("$p")
+  done < <(tmux list-panes -a -F '#{pane_id}|#{pane_current_command}|#{pane_active}')
+  (( ${#matches[@]} == 1 )) || fail "no unique active Neovim pane (${#matches[@]} candidates)"
+  pane=${matches[0]}
+fi
+log "Target pane=$pane"
+
+# A tmux-managed Neovim instance normally supplies --listen <socket>.
+pid=$(tmux display-message -p -t "$pane" '#{pane_pid}')
+args=$(ps -p "$pid" -o command= 2>/dev/null || true)
+regex='(^|[[:space:]])--listen[[:space:]]+([^[:space:]]+)'
+if [[ "$args" =~ $regex ]]; then
+  socket=${BASH_REMATCH[2]}
+  log "RPC socket=$socket"
+  nvim_bin="$HOME/.local/bin/nvim"
+  [[ -x "$nvim_bin" ]] || nvim_bin=$(command -v nvim || true)
+  if [[ -x "$nvim_bin" && -S "$socket" ]]; then
+    if "$nvim_bin" --server "$socket" --remote-send '<C-\><C-N>:Motions<CR>' >> "$LOG" 2>&1; then
+      log "RPC command delivered"
+      printf 'method=rpc pane=%s\n' "$pane"
+      exit 0
+    fi
+    log "RPC delivery failed; falling back to tmux"
+  else
+    log "RPC binary or socket unavailable; falling back to tmux"
+  fi
+else
+  log "Pane process has no --listen argument; falling back to tmux"
+fi
+
+# Ctrl-\\ Ctrl-N forces Normal mode even from an unfinished Ex command.
+# Escape follows to cancel any transient key sequence.
+tmux send-keys -t "$pane" 'C-\' C-n || fail 'could not reset Neovim mode'
+sleep 0.08
+tmux send-keys -t "$pane" Escape || fail 'could not send Escape'
+sleep 0.08
+tmux send-keys -t "$pane" -l ':Motions' || fail 'could not send command'
+tmux send-keys -t "$pane" Enter || fail 'could not confirm command'
+log "tmux command delivered"
+printf 'method=tmux pane=%s\n' "$pane"

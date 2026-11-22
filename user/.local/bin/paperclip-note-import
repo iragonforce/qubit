@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+
+if __name__ == "__main__":
+    import sys as _ops_sys
+    if _ops_sys.argv[1:] == ["--help"]:
+        print('Import existing Paperclip notes using the configured local integration.\nUsage: paperclip-note-import \n\nSource: hosts/qubit/files/.local/bin/paperclip-note-import in ~/ops\nSee man paperclip-note-import for the existing call sites and argument handling.')
+        raise SystemExit(0)
+# Import existing Paperclip notes using the configured local integration. See paperclip-note-import(1) for source and integration details.
+import json, pathlib, sys
+root=pathlib.Path('/Users/iragonforce/Library/Mobile Documents/iCloud~md~obsidian/Documents/secondBrain/Homelab/Paperclip').resolve()
+payload=sys.stdin.read(512*1024+1)
+if len(payload)>512*1024:raise SystemExit('Note update too large')
+data=json.loads(payload)
+for relative,text in data['files'].items():
+    p=(root/relative).resolve()
+    if not p.is_relative_to(root) or p.suffix!='.md' or not isinstance(text,str):raise SystemExit('Invalid note path')
+    p.parent.mkdir(parents=True,exist_ok=True)
+    temporary=p.with_suffix('.md.paperclip-tmp');temporary.write_text(text);temporary.replace(p)
+print('Notes updated')

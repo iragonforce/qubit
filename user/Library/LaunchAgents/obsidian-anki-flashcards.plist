@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/iragonforce</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>Label</key>
+	<string>obsidian-anki-flashcards</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/opt/python@3.15/bin/python3.15</string>
+		<string>/Users/iragonforce/.local/bin/obsidian-anki-flashcards</string>
+		<string>--once</string>
+		<string>--auto-apply</string>
+		<string>--vault</string>
+		<string>/Users/iragonforce/Library/Mobile Documents/iCloud~md~obsidian/Documents/secondBrain</string>
+		<string>--reviewer</string>
+		<string>/Users/iragonforce/Downloads/obsidian_apple_review.py</string>
+		<string>--state-dir</string>
+		<string>/Users/iragonforce/.local/state/obsidian-ai-automation</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/iragonforce/.local/state/obsidian-ai-automation/agent.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/iragonforce/.local/state/obsidian-ai-automation/agent.log</string>
+	<key>StartInterval</key>
+	<integer>300</integer>
+</dict>
+</plist>

@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# Invoke the host-specific Tensor power shortcut; interfaces differ between deployments. See tensor(1) for source and integration details.
+if [ "${1-}" = '--help' ] && [ "$#" -eq 1 ]; then
+  cat <<'OPS_USAGE_TEXT'
+Invoke the host-specific Tensor power shortcut; interfaces differ between deployments.
+Usage: tensor  [ARGUMENT ...]
+echo "Usage: tensor {poweron|poweroff|reboot|status}"
+Source: hosts/qubit/files/bin/power-tensor in ~/ops
+See man tensor for the existing call sites and argument handling.
+OPS_USAGE_TEXT
+  exit 0
+fi
+
+HOST="tensor"
+WOL_HOST="nexus"
+MAC="bc:fc:e7:6f:95:42"
+BROADCAST="192.168.1.255"
+
+is_up() {
+    ssh -o BatchMode=yes \
+        -o ConnectTimeout=2 \
+        -o ConnectionAttempts=1 \
+        "$HOST" true &>/dev/null
+}
+
+wait_for() {
+    local state="$1"
+    local timeout="$2"
+    local start=$SECONDS
+
+    while (( SECONDS - start < timeout )); do
+        if is_up; then
+            [[ "$state" == "up" ]] && return 0
+        else
+            [[ "$state" == "down" ]] && return 0
+        fi
+        sleep 2
+    done
+
+    echo "Timeout waiting for tensor to go $state" >&2
+    return 1
+}
+
+case "${1:-}" in
+    poweron)
+        ssh "$WOL_HOST" wakeonlan -i "$BROADCAST" "$MAC" || exit 1
+        wait_for up 180 && echo "tensor is up"
+        ;;
+
+    poweroff)
+        ssh "$HOST" sudo systemctl poweroff || true
+        wait_for down 60 && echo "tensor is down"
+        ;;
+
+    reboot)
+        ssh "$HOST" sudo systemctl reboot || true
+        wait_for down 60 || exit 1
+        echo "tensor is down"
+
+        wait_for up 180 && echo "tensor is up"
+        ;;
+
+    status)
+        if is_up; then
+            echo "tensor is up"
+        else
+            echo "tensor is down"
+        fi
+        ;;
+
+    *)
+        echo "Usage: tensor {poweron|poweroff|reboot|status}"
+        exit 1
+        ;;
+esac

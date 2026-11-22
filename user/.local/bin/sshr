@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Launch SSH through the existing tmux integration. See sshr(1) for source and integration details.
+set -euo pipefail
+
+exec "$HOME/.local/bin/tmux-ssh" "$@"

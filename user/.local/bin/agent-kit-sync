@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+# Legacy agent-kit distribution; creates backup copies and reloads tmux. See agent-kit-sync(1) for source and integration details.
+"""Sync the canonical Qubit kit to managed mirrors and Nexus context."""
+
+if __name__ == "__main__":
+    import sys as _ops_sys
+    if _ops_sys.argv[1:] == ["--help"]:
+        print('Legacy agent-kit distribution; creates backup copies and reloads tmux.\nUsage: agent-kit-sync \n\nSource: hosts/qubit/files/.local/bin/agent-kit-sync in ~/ops\nSee man agent-kit-sync for the existing call sites and argument handling.')
+        raise SystemExit(0)
+from datetime import datetime
+from pathlib import Path
+import hashlib
+import shutil
+import socket
+import subprocess
+
+if socket.gethostname().split('.')[0]!='qubit':
+    raise SystemExit('Run agent-kit-sync on Qubit, the canonical source host.')
+kit=Path.home()/'.config/homelab/agent-kit'
+stamp=datetime.now().strftime('%Y%m%d-%H%M%S')
+shutil.copy2(kit/'AGENTS.md',kit/'context/AGENTS.md')
+for root in [kit/'context',kit]:
+    files=sorted(p for p in root.rglob('*') if p.is_file() and p.name!='SHA256SUMS')
+    (root/'SHA256SUMS').write_text(''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+str(p.relative_to(root))+'\n' for p in files))
+def run(args):subprocess.run(args,check=True)
+run(['python3',str(kit/'admin/install-host.py'),str(kit)])
+for host in ['tensor','nexus']:
+    run(['ssh','-o','BatchMode=yes','-o','ConnectTimeout=8',host,
+         'mkdir -p ~/.config/homelab; if [ -d ~/.config/homelab/agent-kit ]; then '
+         f'mkdir -p ~/.local/state/agent-kit-sync/{stamp}; '
+         f'cp -a ~/.config/homelab/agent-kit ~/.local/state/agent-kit-sync/{stamp}/; fi'])
+    run(['rsync','-az','--delete',str(kit)+'/',host+':.config/homelab/agent-kit/'])
+    run(['ssh',host,'python3 ~/.config/homelab/agent-kit/admin/install-host.py '
+         '~/.config/homelab/agent-kit'])
+run(['ssh','nexus','sudo -n python3 ~/.config/homelab/agent-kit/admin/deploy-runtime.py'])
+print('Canonical kit deployed. Existing Hermes conversations retain loaded instructions until restarted.')

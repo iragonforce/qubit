@@ -1,0 +1,539 @@
+#!/usr/bin/env python3
+# Process changed Obsidian notes through the existing review and Anki workflow. See obsidian-anki-flashcards(1) for source and integration details.
+"""Automate Obsidian note enrichment through the existing Apple Shortcut reviewer.
+
+Default: track only new/changed notes since --baseline. Run from a macOS
+LaunchAgent at regular intervals. No API keys or additional Python packages.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+
+HOME = Path.home()
+DEFAULT_VAULT = HOME / "Library/Mobile Documents/iCloud~md~obsidian/Documents/secondBrain"
+DEFAULT_REVIEWER = HOME / "Downloads/obsidian_apple_review.py"
+DEFAULT_STATE = HOME / ".local/state/obsidian-ai-automation"
+LABEL = "obsidian-anki-flashcards"
+EXCLUDE_DIRS = {
+    ".obsidian", ".git", ".trash", "bin", "_courses(_courses)",
+    "_courses", "homelab", "templates", "_templates", "archive", "archives", "trash",
+}
+SCHEDULE_SECONDS = 300
+QUIET_SECONDS = 300
+MIN_WORDS = 5
+MAX_NOTE_BYTES = 90_000
+MAX_EXISTING_CARDS = 12
+MAX_AI_CALLS_PER_DAY = 100000
+
+
+
+def without_true_recall_metadata(blob: bytes) -> bytes:
+    lines = blob.decode("utf-8").splitlines(keepends=True)
+    inside_yaml = bool(lines and lines[0].strip() == "---")
+    result = []
+
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+
+        if inside_yaml and index > 0 and stripped == "---":
+            inside_yaml = False
+
+        if inside_yaml and line.startswith("flashcard_uid:"):
+            continue
+
+        if (stripped.startswith("<!-- true-recall:")
+                and stripped.endswith("-->")):
+            continue
+
+        result.append(line)
+
+    return "".join(result).encode("utf-8")
+
+
+
+def _ai_tag_present(raw):
+    import re
+    text = raw.decode("utf-8")
+    fm = re.match(r"\A---\r?\n(.*?)\r?\n---(?=\r?\n|\Z)", text, re.S)
+    if not fm:
+        return False
+
+    header = fm.group(1)
+    tags = re.search(r"(?m)^tags:[ \t]*\r?$", header)
+
+    if tags:
+        for line in header[tags.end():].splitlines():
+            if not line.strip():
+                continue
+            if not line[0].isspace():
+                break
+            if re.fullmatch(r"""\s*-\s*['"]?ai-processed['"]?\s*""", line):
+                return True
+
+    inline = re.search(r"(?m)^tags:[ \t]*\[([^\]\r\n]*)\]", header)
+    if inline:
+        return any(x.strip().strip("'\"") == "ai-processed"
+                   for x in inline.group(1).split(","))
+
+    return False
+
+
+def _mark_ai_processed(path):
+    import re
+    raw = path.read_bytes()
+    if _ai_tag_present(raw):
+        return
+
+    text = raw.decode("utf-8")
+    nl = "\r\n" if "\r\n" in text else "\n"
+    fm = re.match(r"\A---\r?\n(.*?)\r?\n---(?=\r?\n|\Z)", text, re.S)
+
+    if not fm:
+        updated = f"---{nl}tags:{nl}  - ai-processed{nl}---{nl}" + text
+    else:
+        header = fm.group(1)
+        block = re.search(r"(?m)^tags:[ \t]*\r?$", header)
+        inline = re.search(r"(?m)^tags:[ \t]*\[([^\]\r\n]*)\][ \t]*\r?$", header)
+        scalar = re.search(r"(?m)^tags:[ \t]*([^\[\]\r\n]+)[ \t]*\r?$", header)
+
+        if block:
+            header = header[:block.end()] + nl + "  - ai-processed" + header[block.end():]
+        elif inline:
+            prior = inline.group(1).strip()
+            combined = prior + ", ai-processed" if prior else "ai-processed"
+            header = header[:inline.start()] + f"tags: [{combined}]" + header[inline.end():]
+        elif scalar:
+            prior = scalar.group(1).strip()
+            header = header[:scalar.start()] + f"tags: [{prior}, ai-processed]" + header[scalar.end():]
+        else:
+            header = f"tags:{nl}  - ai-processed{nl}" + header
+
+        updated = text[:fm.start(1)] + header + text[fm.end(1):]
+
+    path.write_text(updated, encoding="utf-8")
+
+def digest(blob: bytes) -> str:
+    return hashlib.sha256(blob).hexdigest()
+
+
+def stamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def write_json_atomic(path: Path, obj: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(obj, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def default_state() -> dict:
+    return {"version": 1, "created": stamp(), "entries": {}, "failures": {}}
+
+
+def read_state(path: Path) -> dict:
+    if not path.is_file():
+        raise SystemExit("No baseline found. Run --baseline first.")
+    state = json.loads(path.read_text(encoding="utf-8"))
+    if state.get("version") != 1 or not isinstance(state.get("entries"), dict):
+        raise SystemExit("Invalid automation state version")
+    state.setdefault("failures", {})
+    return state
+
+
+def scan(vault: Path):
+    for path in sorted(vault.rglob("*.md")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        rel = path.relative_to(vault)
+        if any(part.lower() in EXCLUDE_DIRS or part.startswith(".") for part in rel.parts[:-1]):
+            continue
+        if rel.name.startswith("."):
+            continue
+        try:
+            st = path.stat()
+            if not 0 < st.st_size <= MAX_NOTE_BYTES:
+                continue
+            raw = path.read_bytes()
+            if b"\x00" in raw:
+                continue
+            text = raw.decode("utf-8")
+        except (OSError, UnicodeError):
+            continue
+        yield str(rel), path, raw, text, st.st_mtime
+
+
+def substantive(text: str) -> bool:
+    body = re.sub(r"\A\ufeff?---\r?\n.*?\r?\n(?:---|\.\.\.)\r?\n", "", text, count=1, flags=re.S)
+    body = re.split(r"(?m)^##[ \t]+(?:Flashcards|See Also)[ \t]*$", body, maxsplit=1)[0]
+    # Count words, including technical vocabulary; ignore formatting-only notes.
+    return len(re.findall(r"\b[\w-]+\b", body)) >= MIN_WORDS
+
+
+def cards_count(text: str) -> int:
+    return len(re.findall(r"(?m)^[ \t]*\?\?[ \t]*$", text))
+
+
+def frontmatter_tagged(text: str) -> bool:
+    m = re.match(r"\A\ufeff?---\r?\n(.*?)\r?\n---", text, re.S)
+    if not m:
+        return False
+    y = m.group(1)
+    return bool(re.search(r"(?mi)^\s*-\s*['\"]?flashcards['\"]?\s*$", y) or
+                re.search(r"(?mi)^tags:\s*\[[^\n]*\bflashcards\b", y))
+
+
+def tag_note(vault: Path, rel: str, source: Path, old: bytes, text: str, state_dir: Path) -> bytes:
+    """Add the required True Recall tag with a verified backup, only for simple YAML."""
+    if frontmatter_tagged(text):
+        return old
+    line_end = "\r\n" if "\r\n" in text else "\n"
+    m = re.match(r"\A(\ufeff?---\r?\n)(.*?)(\r?\n---\r?\n)", text, re.S)
+    if not m:
+        if text.lstrip("\ufeff").startswith("---"):
+            raise ValueError("Malformed YAML frontmatter; manual correction required")
+        updated = f"---{line_end}tags:{line_end}  - flashcards{line_end}---{line_end}{line_end}" + text
+    else:
+        prefix, yaml, suffix = m.groups()
+        lines = yaml.splitlines()
+        headers = [i for i, line in enumerate(lines) if re.match(r"^tags\s*:", line)]
+        if len(headers) > 1:
+            raise ValueError("Multiple YAML tags keys")
+        if not headers:
+            lines += ["tags:", "  - flashcards"]
+        else:
+            i = headers[0]
+            v = lines[i].split(":", 1)[1].strip()
+            if v.startswith("[") and v.endswith("]"):
+                old_items = v[1:-1].strip()
+                lines[i] = "tags: [" + (old_items + ", " if old_items else "") + "flashcards]"
+            elif v not in ("", "null", "~") and not v.startswith("#"):
+                raise ValueError("Unsupported YAML tags format; manual tagging required")
+            else:
+                pos = i + 1
+                while pos < len(lines) and (not lines[pos].strip() or lines[pos].startswith((" ", "\t"))):
+                    pos += 1
+                child_lines = lines[i + 1:pos]
+                if any(l.strip() and not re.match(r"^[ \t]+-[ \t]+", l) and not l.lstrip().startswith("#") for l in child_lines):
+                    raise ValueError("Complex YAML tags structure; manual tagging required")
+                indents = [re.match(r"^([ \t]+)-", l).group(1) for l in child_lines if re.match(r"^[ \t]+-", l)]
+                lines.insert(pos, (indents[0] if indents else "  ") + "- flashcards")
+        updated = prefix + line_end.join(lines) + suffix + text[m.end():]
+    new = updated.encode("utf-8")
+    backups = state_dir / "tag-backups" / rel
+    backups.parent.mkdir(parents=True, exist_ok=True)
+    if not backups.exists():
+        backups.write_bytes(old)
+        if digest(backups.read_bytes()) != digest(old):
+            raise OSError("Tag backup verification failed")
+    if source.read_bytes() != old:
+        raise OSError("Source changed while adding tag")
+    fd, tmp = tempfile.mkstemp(prefix=".true-recall-tag-", dir=str(source.parent))
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(new)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(tmp, source.stat().st_mode & 0o777)
+        os.replace(tmp, source)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    return new
+
+
+def parse_run(stdout: str) -> Path:
+    hit = re.search(r"(?m)^Run:\s*(.+?)\s*$", stdout)
+    if not hit:
+        raise ValueError("Reviewer did not return a successful Run directory")
+    return Path(hit.group(1)).expanduser()
+
+
+def process_one(args, state, rel, path, original, text, log_dir):
+    print(f"PROCESS: {rel}", flush=True)
+    logfile = log_dir / f"{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.log"
+    output = ""
+    try:
+        tagged = tag_note(args.vault, rel, path, original, text, args.state_dir)
+        old_digest = digest(tagged)
+        p = subprocess.run(
+            [sys.executable, str(args.reviewer), str(path)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            timeout=args.timeout,
+            env={**os.environ, "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + os.environ.get("PATH", "")},
+        )
+        output = p.stdout
+        if p.returncode != 0:
+            raise RuntimeError(f"Reviewer failed (exit {p.returncode}): {output[-700:]}")
+        run = parse_run(output)
+        manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+        if Path(manifest["source"]).resolve() != path.resolve():
+            raise ValueError("Preview refers to a different note")
+        if manifest["original_sha256"] != old_digest:
+            raise ValueError("Preview source hash mismatch")
+        preview = (run / "note.preview.md").read_text(encoding="utf-8")
+        if not 1 <= cards_count(preview) - cards_count(tagged.decode("utf-8")) <= 3:
+            raise ValueError("Expected 1-3 additional True Recall cards")
+        if not frontmatter_tagged(preview):
+            raise ValueError("Preview missing True Recall tag")
+        if args.auto_apply:
+            applied = subprocess.run(
+                [sys.executable, str(args.reviewer), "--apply", str(run), "--mode", "full", "--approve", "--accept-flagged"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                timeout=90,
+            )
+            output += "\n=== APPLY ===\n" + applied.stdout
+            if applied.returncode:
+                raise RuntimeError(f"Apply failed: {applied.stdout[-700:]}")
+            new_digest = digest(path.read_bytes())
+            if new_digest != manifest["preview_sha256"]["full"]:
+                raise ValueError("Applied content hash did not match preview")
+            message = f"APPLIED: {rel} | {run}"
+        else:
+            new_digest = old_digest
+            message = f"STAGED (manual approval required): {rel} | {run}"
+        if args.auto_apply:
+            _mark_ai_processed(path)
+            new_digest = digest(path.read_bytes())
+
+        state["entries"][rel] = {"sha256": new_digest, "last_run": str(run), "updated": stamp(),
+                                 "preview_sha256": manifest["preview_sha256"]["full"]}
+        state["failures"].pop(rel, None)
+        print(message, flush=True)
+        return True
+    except Exception as exc:
+        output += f"\nERROR: {exc}\n"
+        sha = digest(path.read_bytes()) if path.exists() else digest(original)
+        previous = state["failures"].get(rel, {})
+        count = previous.get("attempts", 0) + 1 if previous.get("sha256") == sha else 1
+        backoff = min(1800 * (2 ** min(count - 1, 4)), 86400)
+        state["failures"][rel] = {"sha256": sha, "attempts": count,
+                                  "retry_after": time.time() + backoff, "error": str(exc)[:600]}
+        print(f"FAILED: {rel}: {exc} | retry after {backoff // 60} min", flush=True)
+        return False
+    finally:
+        logfile.write_text(f"FILE: {rel}\nDATE: {stamp()}\n{output}", encoding="utf-8")
+
+
+def baseline(args):
+    state_file = args.state_dir / "state.json"
+    if state_file.exists():
+        raise SystemExit("Baseline already exists; refusing to overwrite tracked history")
+    items = list(scan(args.vault))
+    state = default_state()
+    for rel, _, raw, _, _ in items:
+        state["entries"][rel] = {"sha256": digest(raw), "baseline": stamp()}
+    write_json_atomic(state_file, state)
+    print(f"Baseline saved: {len(items)} notes | {state_file}")
+    print("Existing notes will not be reprocessed until they are edited.")
+
+
+def run_once(args):
+    args.state_dir.mkdir(parents=True, exist_ok=True)
+    with (args.state_dir / "lock").open("a+") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Another automation pass is still running; skipping")
+            return
+        state_file = args.state_dir / "state.json"
+        state = read_state(state_file)
+        now = time.time()
+        log_dir = args.state_dir / "runs"
+        log_dir.mkdir(exist_ok=True)
+        changed, queued = 0, 0
+        today = datetime.now().astimezone().date().isoformat()
+        usage = state.get("daily_usage", {})
+        if usage.get("date") != today:
+            usage = {"date": today, "count": 0}
+            state["daily_usage"] = usage
+        if usage["count"] >= MAX_AI_CALLS_PER_DAY and not args.now:
+            print(f"DAILY LIMIT: {MAX_AI_CALLS_PER_DAY} AI calls reached; next run tomorrow")
+            return
+        for rel, path, raw, text, mtime in scan(args.vault):
+            if args.note is not None and rel != args.note:
+                continue
+            old = state["entries"].get(rel, {})
+            if _ai_tag_present(raw):
+                state["entries"][rel] = {
+                    **state["entries"].get(rel, {}),
+                    "sha256": digest(raw),
+                    "skipped_tag": "ai-processed",
+                }
+                state["failures"].pop(rel, None)
+                continue
+
+            new_sha = digest(raw)
+
+            # True Recall adds IDs after collecting flashcards.
+            # Those metadata-only changes must not retrigger AI.
+            if old.get("sha256") != new_sha and old.get("last_run"):
+                previous_preview = Path(old["last_run"]) / "note.preview.md"
+
+                if (
+                    previous_preview.is_file()
+                    and without_true_recall_metadata(raw)
+                    == without_true_recall_metadata(
+                        previous_preview.read_bytes()
+                    )
+                ):
+                    state["entries"][rel]["sha256"] = new_sha
+                    continue
+
+            if old.get("sha256") == new_sha:
+                continue
+            # Recognize a preview applied manually after a preview-only run.
+            if old.get("preview_sha256") == new_sha:
+                state["entries"][rel]["sha256"] = new_sha
+                state["entries"][rel]["updated"] = stamp()
+                continue
+            changed += 1
+            if not args.now and now - mtime < QUIET_SECONDS:
+                continue
+            if not substantive(text):
+                continue
+            existing = cards_count(text)
+            if existing >= MAX_EXISTING_CARDS and not args.now:
+                print(f"SKIP >= {MAX_EXISTING_CARDS} cards: {rel}", flush=True)
+                continue
+            failure = state["failures"].get(rel, {})
+            if not args.now and failure.get("sha256") == new_sha and now < failure.get("retry_after", 0):
+                continue
+            if usage["count"] >= MAX_AI_CALLS_PER_DAY and not args.now:
+                print("Daily AI request limit reached; remaining notes queued")
+                break
+            queued += 1
+            usage["count"] += 1
+            # Record quota before invoking an external service so failures count too.
+            write_json_atomic(state_file, state)
+            process_one(args, state, rel, path, raw, text, log_dir)
+            write_json_atomic(state_file, state)
+            if queued >= args.limit:
+                break
+        write_json_atomic(state_file, state)
+        print(f"SCAN: changed={changed}, attempted={queued}, mode={'auto-apply' if args.auto_apply else 'preview-only'}")
+
+
+def patch_reviewer(args):
+    path = args.reviewer
+    s = path.read_text(encoding="utf-8")
+    old = ('    if mode == "full" and manifest.get("full_blockers"):\n'
+           '        raise PreviewError("Full edit blocked: " + repr(manifest["full_blockers"]))')
+    new = ('    if mode == "full" and manifest.get("full_blockers"):\n'
+           '        print("WARNING: Full edit removes or changes source constructs: "\n'
+           '              + repr(manifest["full_blockers"]), file=sys.stderr)')
+    if old not in s:
+        if new in s:
+            print("Reviewer already patched for advisory full-edit warnings")
+            return
+        raise SystemExit("Reviewer version differs from expected. No changes made.")
+    if s.count(old) != 1:
+        raise SystemExit("Ambiguous reviewer patch; aborting")
+    revised = s.replace(old, new, 1)
+    # Keep blocker list in the manifest, but describe it as a warning in reviews.
+    revised = revised.replace('"Full edit: " + ("BLOCKED by deterministic protection checks" if blockers else "available after manual review")',
+                              '"Full edit: available after manual review; check source omissions"')
+    revised = revised.replace('"## Full-edit blockers"', '"## Full-edit warnings"')
+    revised = revised.replace('print("Full edit BLOCKED: "', 'print("Full edit WARNINGS: "')
+    compile(revised, str(path), "exec")
+    backup = path.with_name("obsidian_apple_review.before_auto.py")
+    if backup.exists():
+        raise SystemExit(f"Backup exists, refusing to overwrite: {backup}")
+    shutil.copy2(path, backup)
+    if backup.read_text(encoding="utf-8") != s:
+        raise SystemExit("Reviewer backup validation failed")
+    path.write_text(revised, encoding="utf-8")
+    print("Patched reviewer to warn instead of blocking full rewrites")
+    print("Reviewer backup:", backup)
+
+
+def install_agent(args):
+    agent_path = HOME / "Library/LaunchAgents" / (LABEL + ".plist")
+    agent_path.parent.mkdir(parents=True, exist_ok=True)
+    args.state_dir.mkdir(parents=True, exist_ok=True)
+    if agent_path.exists():
+        raise SystemExit(f"LaunchAgent already exists: {agent_path}")
+    if not (args.state_dir / "state.json").is_file():
+        raise SystemExit("Run --baseline before installing LaunchAgent")
+    if not args.reviewer.is_file():
+        raise SystemExit("Reviewer script missing")
+    values = {
+        "Label": LABEL,
+        "ProgramArguments": [sys.executable, str(Path(__file__).resolve()), "--once", "--auto-apply",
+                             "--vault", str(args.vault), "--reviewer", str(args.reviewer),
+                             "--state-dir", str(args.state_dir)],
+        "RunAtLoad": True,
+        "StartInterval": SCHEDULE_SECONDS,
+        "StandardOutPath": str(args.state_dir / "agent.log"),
+        "StandardErrorPath": str(args.state_dir / "agent.err.log"),
+        "EnvironmentVariables": {"PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", "HOME": str(HOME)},
+        "ProcessType": "Background",
+    }
+    agent_path.write_bytes(plistlib.dumps(values, fmt=plistlib.FMT_XML))
+    print("LaunchAgent installed:", agent_path)
+    print("To enable:")
+    print(f"  launchctl bootstrap gui/$(id -u) '{agent_path}'")
+    print("To disable:")
+    print(f"  launchctl bootout gui/$(id -u) '{agent_path}'")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--baseline", action="store_true", help="Register existing notes without generating anything")
+    group.add_argument("--once", action="store_true", help="Process changed notes once")
+    group.add_argument("--patch-reviewer", action="store_true", help="Allow full rewrites with protection warnings")
+    group.add_argument("--install-agent", action="store_true", help="Write the macOS LaunchAgent")
+    parser.add_argument("--vault", type=Path, default=DEFAULT_VAULT)
+    parser.add_argument("--reviewer", type=Path, default=DEFAULT_REVIEWER)
+    parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE)
+    parser.add_argument("--limit", type=int, default=1)
+    parser.add_argument("--now", action="store_true", help="Bypass edit quiet period for a deliberate manual test")
+    parser.add_argument("--note", help="Process one vault-relative path when it differs from baseline")
+    parser.add_argument("--auto-apply", action="store_true", help="Apply full rewrites in iCloud with approval and backups")
+    parser.add_argument("--timeout", type=int, default=420)
+    args = parser.parse_args()
+    args.vault = args.vault.expanduser().resolve()
+    args.reviewer = args.reviewer.expanduser().resolve()
+    args.state_dir = args.state_dir.expanduser().resolve()
+    if not args.vault.is_dir() or not (args.vault / ".obsidian").is_dir():
+        parser.error("Missing Obsidian vault: " + str(args.vault))
+    if args.limit < 1 or args.timeout < 10:
+        parser.error("Invalid --limit or --timeout")
+    if args.note and (args.note.startswith("/") or ".." in Path(args.note).parts):
+        parser.error("--note must be a safe relative vault path")
+    if args.baseline:
+        baseline(args)
+    elif args.once:
+        if not args.reviewer.is_file():
+            parser.error("Missing reviewer: " + str(args.reviewer))
+        run_once(args)
+    elif args.patch_reviewer:
+        patch_reviewer(args)
+    elif args.install_agent:
+        install_agent(args)
+
+
+if __name__ == "__main__":
+    main()

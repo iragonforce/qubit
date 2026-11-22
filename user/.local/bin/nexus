@@ -1,0 +1,3 @@
+#!/bin/sh
+# Invoke the existing Nexus host power shortcut. See nexus(1) for source and integration details.
+exec /Users/iragonforce/.local/bin/homelab-power nexus "$@"

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Invoke the existing Qubit host power shortcut. See qubit(1) for source and integration details.
+exec /Users/iragonforce/.local/bin/homelab-power qubit "$@"

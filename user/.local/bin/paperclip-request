@@ -1,0 +1,22 @@
+#!/usr/bin/python3
+# Query status or submit an explicitly requested task to the existing Paperclip bridge. See paperclip-request(1) for source and integration details.
+"""Submit a current request to Paperclip using Qubit's existing SSH identity."""
+
+if __name__ == "__main__":
+    import sys as _ops_sys
+    if _ops_sys.argv[1:] == ["--help"]:
+        print("Query status or submit an explicitly requested task to the existing Paperclip bridge.\nUsage: paperclip-request  [ARGUMENT ...]\nif action not in ['ask','status']:raise SystemExit('Usage: paperclip-request ask|status')\nSource: hosts/qubit/files/.local/bin/paperclip-request in ~/ops\nSee man paperclip-request for the existing call sites and argument handling.")
+        raise SystemExit(0)
+import json,subprocess,sys
+action=sys.argv[1] if len(sys.argv)>1 else 'status'
+if action not in ['ask','status']:raise SystemExit('Usage: paperclip-request ask|status')
+text=(' '.join(sys.argv[2:]) if len(sys.argv)>2 else sys.stdin.read(12001)) if action=='ask' else ''
+if action=='ask' and (not text.strip() or len(text)>12000):raise SystemExit('Provide a request of 1–12000 characters')
+command=['/usr/bin/ssh','-o','BatchMode=yes','-o','ConnectTimeout=10','nexus','sudo docker exec -i -u 1000:1000 paperclip /app/server/node_modules/.bin/tsx /paperclip/tools/qubit-control.ts']
+try:
+    result=subprocess.run(command,input=json.dumps({'action':action,'text':text}),capture_output=True,text=True,timeout=45)
+except subprocess.TimeoutExpired:raise SystemExit('Nexus did not respond in time; check Tailscale/SSH.')
+if result.returncode:
+    print('Paperclip request failed. Check Nexus reachability and the private service diagnostics.',file=sys.stderr)
+    raise SystemExit(result.returncode)
+print(result.stdout.strip())
